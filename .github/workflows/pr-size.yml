@@ -1,0 +1,98 @@
+# Reusable: label a pull request P1–P4 by the size of its code change.
+#
+# Caller (in any Aerostacks repo, .github/workflows/pr-size.yml):
+#
+#   name: PR size
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review]
+#   jobs:
+#     size:
+#       permissions:
+#         pull-requests: write
+#         issues: write
+#       uses: Aerostacks/.github/.github/workflows/pr-size.yml@main
+#
+# P1 = biggest change (needs the most review attention) … P4 = smallest.
+# Size = additions + deletions over files not matched by `ignore`.
+name: PR size label
+
+on:
+  workflow_call:
+    inputs:
+      p1:
+        description: Changed lines at or above which the PR is P1
+        type: number
+        default: 1000
+      p2:
+        description: Changed lines at or above which the PR is P2
+        type: number
+        default: 400
+      p3:
+        description: Changed lines at or above which the PR is P3 (below is P4)
+        type: number
+        default: 100
+      ignore:
+        description: Newline-separated regexes; matching file paths are not counted
+        type: string
+        default: |
+          (^|/)(uv|poetry|Cargo|Gemfile|composer|pnpm-lock|yarn)\.lock$
+          (^|/)package-lock\.json$
+          (^|/)(dist|build|vendor|node_modules)/
+          \.min\.(js|css)$
+          \.generated\.
+          \.tsbuildinfo$
+          \.ipynb$
+          \.(png|jpe?g|gif|webp|bmp|svg|ico|pdf|mp4|npz|npy|pkl|onnx|h5|db|sqlite|zst|tar|gz|zip)$
+          (^|/)public/data/
+      runs-on:
+        description: JSON runner label(s)
+        type: string
+        default: '["self-hosted", "linux", "X64"]'
+
+jobs:
+  label:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          P1: ${{ inputs.p1 }}
+          P2: ${{ inputs.p2 }}
+          P3: ${{ inputs.p3 }}
+          IGNORE: ${{ inputs.ignore }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            if (!pr) { core.notice("Not a pull_request event; nothing to label."); return; }
+            const ignore = process.env.IGNORE.split("\n").map(s => s.trim()).filter(Boolean).map(s => new RegExp(s));
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+            let counted = 0, skipped = 0, size = 0;
+            for (const f of files) {
+              if (ignore.some(re => re.test(f.filename))) { skipped++; continue; }
+              counted++;
+              size += f.additions + f.deletions;
+            }
+            const [p1, p2, p3] = [process.env.P1, process.env.P2, process.env.P3].map(Number);
+            const level = size >= p1 ? "P1" : size >= p2 ? "P2" : size >= p3 ? "P3" : "P4";
+            const meta = {
+              P1: { color: "b60205", description: `Huge change (≥ ${p1} lines) — needs the most review attention` },
+              P2: { color: "d93f0b", description: `Large change (${p2}–${p1 - 1} lines)` },
+              P3: { color: "fbca04", description: `Medium change (${p3}–${p2 - 1} lines)` },
+              P4: { color: "0e8a16", description: `Small change (< ${p3} lines)` },
+            };
+            for (const [name, m] of Object.entries(meta)) {
+              try { await github.rest.issues.createLabel({ owner, repo, name, ...m }); }
+              catch (e) { if (e.status !== 422) throw e; }  // 422: already exists
+            }
+            const current = pr.labels.map(l => l.name);
+            for (const name of current.filter(n => n in meta && n !== level)) {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number: pr.number, name });
+            }
+            if (!current.includes(level)) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: [level] });
+            }
+            const msg = `${level}: ${size} changed lines in ${counted} files (${skipped} ignored)`;
+            core.info(msg);
+            await core.summary.addHeading("PR size").addRaw(msg).write();
